@@ -124,6 +124,72 @@ def contrib_chart(df: pd.DataFrame, title: str):
     return fig
 
 
+
+# ---------------------------------------------------------------------------
+# Time-series helpers (mirror ML_Time_Series.ipynb: chronological 80/20 split)
+# ---------------------------------------------------------------------------
+MA_NAME, ES_NAME, HW_NAME = "Moving Average (7)", "Exponential Smoothing", "Holt-Winters"
+BEST_STYLE = "background-color: #d9f2e0; color: #0b3d1e; font-weight: 600"
+
+
+def make_series(data: pd.DataFrame, which: str) -> pd.Series:
+    """Daily demand: overall, or for one time_of_day bucket (zero-filled, like the notebook)."""
+    if which == "Overall":
+        s = data.set_index("StartDatetime")["Demand"].resample("D").sum()
+    else:
+        s = (data.assign(date=data["StartDatetime"].dt.normalize())
+                 .groupby(["date", "time_of_day"])["Demand"].sum().unstack(fill_value=0)[which])
+        s.index = pd.to_datetime(s.index)
+    s = s.reindex(pd.date_range(s.index.min(), s.index.max(), freq="D"), fill_value=0)
+    s.index.freq = "D"
+    return s
+
+
+def fit_es(series: pd.Series, fixed_alpha: bool):
+    """Overall series: alpha fixed at 0.2 (notebook). Time-of-day series: alpha optimised."""
+    from statsmodels.tsa.holtwinters import SimpleExpSmoothing
+    m = SimpleExpSmoothing(series, initialization_method="heuristic")
+    return m.fit(smoothing_level=0.2, optimized=False) if fixed_alpha else m.fit(optimized=True)
+
+
+@st.cache_data(show_spinner=False)
+def backtest(series: pd.Series, fixed_alpha: bool) -> pd.DataFrame:
+    """Hold-out (last 20%) RMSE/MAE for MA(7) walk-forward, SES and Holt-Winters."""
+    from sklearn.metrics import mean_absolute_error, mean_squared_error
+    from statsmodels.tsa.holtwinters import ExponentialSmoothing
+
+    n = int(len(series) * 0.8)
+    train, test = series.iloc[:n], series.iloc[n:]
+    preds = {}
+
+    hist, p = list(train), []
+    for v in test:                       # walk-forward: add each actual after predicting it
+        p.append(np.mean(hist[-7:]))
+        hist.append(v)
+    preds[MA_NAME] = p
+    preds[ES_NAME] = fit_es(train, fixed_alpha).forecast(len(test))
+    try:
+        preds[HW_NAME] = ExponentialSmoothing(train, trend="add", seasonal="add",
+                                              seasonal_periods=7).fit().forecast(len(test))
+    except Exception:
+        preds[HW_NAME] = None
+
+    rows = {}
+    for name, pr in preds.items():
+        if pr is None:
+            rows[name] = {"RMSE": np.nan, "MAE": np.nan}
+        else:
+            rows[name] = {"RMSE": float(np.sqrt(mean_squared_error(test, pr))),
+                          "MAE": float(mean_absolute_error(test, pr))}
+    return pd.DataFrame(rows).T
+
+
+def highlight_best_rmse(table: pd.DataFrame):
+    """Styler: highlight the row with the lowest RMSE."""
+    best = table["RMSE"].idxmin()
+    return table.style.apply(lambda r: [BEST_STYLE if r.name == best else "" for _ in r], axis=1) \
+                      .format("{:,.2f}")
+
 # ---------------------------------------------------------------------------
 # Sidebar / data
 # ---------------------------------------------------------------------------
@@ -222,37 +288,39 @@ with tab_fc:
     if df is None:
         st.warning(f"Features CSV not found at {DATA_PATH}")
     else:
-        from statsmodels.tsa.holtwinters import ExponentialSmoothing, SimpleExpSmoothing
+        from statsmodels.tsa.holtwinters import ExponentialSmoothing
 
-        c1, c2, c3 = st.columns(3)
+        c1, c2 = st.columns(2)
         periods = ["Overall"] + sorted(df["time_of_day"].dropna().unique())
         which = c1.selectbox("Series", periods)
         horizon = c2.slider("Forecast horizon (days)", 7, 30, 7)
-        methods = c3.multiselect("Methods", ["Moving Average (7)", "Exponential Smoothing", "Holt-Winters"],
-                                 default=["Moving Average (7)"])
 
-        src = df if which == "Overall" else df[df["time_of_day"] == which]
-        series = src.set_index("StartDatetime")["Demand"].resample("D").sum()
-        series.index.freq = "D"
+        series = make_series(df, which)
+        fixed_alpha = which == "Overall"
+        metrics = backtest(series, fixed_alpha)
+        best_method = metrics["RMSE"].idxmin()
+        methods = st.multiselect("Methods", [MA_NAME, ES_NAME, HW_NAME], default=[best_method],
+                                 key=f"methods_{which}")
+
         future = pd.date_range(series.index[-1] + pd.Timedelta(days=1), periods=horizon, freq="D")
-
-        fig = go.Figure(go.Scatter(x=series.index, y=series.values, name="Actual", line=dict(color="#444")))
-        if "Moving Average (7)" in methods:
-            fig.add_scatter(x=future, y=[series.tail(7).mean()] * horizon, name="Moving Average (7)")
-        if "Exponential Smoothing" in methods:
-            m = SimpleExpSmoothing(series, initialization_method="heuristic").fit(smoothing_level=0.2, optimized=False)
-            fig.add_scatter(x=future, y=m.forecast(horizon).values, name="Exponential Smoothing")
-        if "Holt-Winters" in methods:
+        fig = go.Figure(go.Scatter(x=series.index, y=series.values, name="Actual", line=dict(color="#888")))
+        if MA_NAME in methods:
+            fig.add_scatter(x=future, y=[series.tail(7).mean()] * horizon, name=MA_NAME)
+        if ES_NAME in methods:
+            fig.add_scatter(x=future, y=fit_es(series, fixed_alpha).forecast(horizon).values, name=ES_NAME)
+        if HW_NAME in methods:
             try:
                 m = ExponentialSmoothing(series, trend="add", seasonal="add", seasonal_periods=7).fit()
-                fig.add_scatter(x=future, y=m.forecast(horizon).values, name="Holt-Winters")
+                fig.add_scatter(x=future, y=m.forecast(horizon).values, name=HW_NAME)
             except Exception as e:
                 st.caption(f"Holt-Winters failed: {e}")
         fig.update_layout(height=450, yaxis_title="Demand (kWh)", hovermode="x unified",
                           margin=dict(l=10, r=10, t=30, b=10))
         st.plotly_chart(fig, use_container_width=True)
-        st.caption("Moving Average (7) is the recommended baseline: Holt-Winters edges it on a single "
-                   "7-day hold-out but not consistently across periods.")
+
+        st.markdown(f"**Hold-out accuracy - {which}** (chronological 80/20 split)")
+        st.dataframe(highlight_best_rmse(metrics), use_container_width=True)
+        st.caption(f"Lowest RMSE for this series: **{best_method}**.")
 
 # ---------------------------------------------------------------------------
 # Tab 3 - usage patterns
@@ -301,10 +369,26 @@ with tab_models:
         "ROC-AUC": [0.8966, 0.8727, 0.8902, 0.9506, 0.9607, 0.9606],
     }).set_index("Model"), CHOSEN["clf"], "best accuracy, F1 and ROC-AUC (5-fold CV ROC-AUC 0.957).")
 
-    st.subheader("Time-series (last 7 days hold-out)")
+    st.subheader("Time-series - overall daily demand (chronological 80/20 hold-out)")
     show(pd.DataFrame({
         "Method": ["Moving Average", "Exponential Smoothing", "Holt-Winters"],
-        "MAE": [327.76, 333.43, 305.99], "RMSE": [357.52, 359.72, 348.71],
+        "RMSE": [686.95, 789.10, 1023.45], "MAE": [502.51, 569.07, 786.30],
     }).set_index("Method"), CHOSEN["ts"],
-        "chosen as the baseline: walk-forward MAE/RMSE favoured it, and richer models did not beat it. "
-        "Holt-Winters is lower on this single hold-out only.")
+        "lowest RMSE and MAE on the hold-out (walk-forward 7-day average); Holt-Winters is the weakest.")
+
+    st.subheader("Time-series - by time of day (RMSE / MAE)")
+    per = pd.DataFrame({
+        "Period": ["Afternoon", "Evening", "Morning", "Night"],
+        "MA RMSE": [243.94, 386.82, 224.05, 73.78], "MA MAE": [178.46, 299.61, 179.03, 59.62],
+        "ES RMSE": [253.89, 447.45, 219.55, 73.44], "ES MAE": [188.58, 336.87, 168.97, 58.04],
+        "HW RMSE": [326.24, 509.32, 247.02, 83.01], "HW MAE": [249.85, 394.75, 197.51, 66.76],
+    }).set_index("Period")
+
+    def best_cell(row):
+        best = row[["MA RMSE", "ES RMSE", "HW RMSE"]].idxmin()
+        return [BEST_STYLE if c == best else "" for c in row.index]
+
+    st.dataframe(per.style.apply(best_cell, axis=1).format("{:,.2f}"), use_container_width=True)
+    st.success("✅ Best by RMSE: **Moving Average** for Afternoon and Evening; "
+               "**Exponential Smoothing** for Morning and Night (only marginally ahead of Moving Average). "
+               "Holt-Winters is never best.")
